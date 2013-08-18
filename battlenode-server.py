@@ -1,7 +1,10 @@
 #!/usr/bin/env python
 
+
 import random
 from collections import defaultdict
+from twisted.web import server, resource
+from twisted.internet import reactor
 
 VERSION = 0.1
 
@@ -40,6 +43,9 @@ class NonNeighbourLink(Exception):
     pass
 
 class NotEnoughPower(Exception):
+    pass
+
+class CommunicationError(Exception):
     pass
 
 nodetypes = {
@@ -160,8 +166,10 @@ class Game:
             if node.owner:
                 self.visiblenodes[node.owner] |= node.visiblenodes()
 
-    def post(self, player, content):
+    def post(self, request):
         #parse json content
+
+
         content = json.loads(content)
         if not 'command' in content:
             raise CommunicationError("No command in content")
@@ -172,24 +180,39 @@ class Game:
         command = content['command']
         args = content['args']
 
-        if command == 'link':
+        if node:
+            node = content['node']
+            x = int(args[0])
+            y = int(args[1])
+            if x in self.nodes and y in self.nodes[x]:
+                sourcenode = self.nodes[x][y]
+            if sourcenode.owner != player:
+                raise CommunicationError("Sourcenode not owned by player!")
+        else:
+            sourcenode = None
 
+        if command == 'done':
 
-
-        parsedargs = []
-        for a in args:
-            if isinstance(a, str) and a[:4] == 'node':
-                try:
-                    x, y = a[4:].split('_')
-                    x = int(x)
-                    y = int(y)
-                except:
-                    raise CommunicationError("Error parsing node specification: " + a)
-
-                parsedargs.append
+        elif command == 'link':
+            if sourcenode is None:
+                raise CommunicationError("No sourcenode specified, required for " +command)
+            try:
+                x = int(args[1])
+                y = int(args[2])
+            except:
+                raise CommunicationError("Invalid arguments for " + command + ": " + ", ".join(args))
+            if x in self.nodes and y in self.nodes[x]:
+                targetnode = self.nodes[x][y]
+                sourcenode.link(targetnode)
             else:
-                parsedargs.append(a)
-
+                raise CommunicationError("Target node does not exist!")
+        elif command == 'spec':
+            if sourcenode is None:
+                raise CommunicationError("No sourcenode specified, required for " +command)
+            try:
+                newtype = int(args[0])
+            except:
+                raise CommunicationError("Invalid arguments for " + command + ": " + ", ".join(args))
 
 
 
@@ -393,6 +416,44 @@ class Node:
         pass
 
 
+
+class GameResource(resource.Resource):
+    def __init__(self, game):
+        self.game = game
+
+    def render_GET(self, request):
+        try:
+            request.setHeader('Content-Type', "application/json")
+            return self.game.get(request.args)
+        except CommunicationError as e:
+            request.setResponseCode(403)
+            return str(e)
+
+    def render_POST(self, request):
+        try:
+            request.setHeader('Content-Type', "application/json")
+            return self.game.post(request.args)
+        except CommunicationError as e
+            request.setResponseCode(403)
+            return str(e)
+
+class IndexResource(resource.Resource):
+    def __init__(self, games):
+        self.games = games
+
+    def getChild(self, game, request):
+        if game in self.games:
+            return GameResource(self.games[name])
+        else:
+            request.setResponseCode(404)
+            return "Game not found"
+
+class BattleNodeServer:
+    def __init__(self, port):
+        assert isinstance(port, int)
+        self.games = {}
+        reactor.listenTCP(port, server.Site(IndexResource(games)))
+        reactor.run()
 
 
 
