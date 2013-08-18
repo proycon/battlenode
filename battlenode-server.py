@@ -9,17 +9,34 @@ from twisted.internet import reactor
 
 VERSION = 0.1
 
+#TODO: unlink
+#TODO: create game interface
+#TODO: limit links per turn (3 + 3*cores)
+
 class Player:
     def __init__(self, name, beginnode):
         self.name = name
         self.beginnode = beginnode
         self.time = 0
+        self.wins = False
+        self.lost = False
 
     def __hash__(self):
         return hash(self.name)
 
     def tick(self):
         self.time += 1
+
+    def dict(self):
+        return {
+            'name': self.name,
+            'beginx': self.beginnode.x,
+            'beginy': self.beginnode.y,
+            'time': self.time,
+            'wins': self.wins,
+            'lost': self.lost
+        }
+
 
 class NodeType:
     def __init__(self, id, label, description, resistance, consumption, vision, buildduration, resistancemodifier=1, hidden=False):
@@ -31,13 +48,31 @@ class NodeType:
         self.vision = vision
         self.buildduration = buildduration #in turns
         self.resistancemodifier = resistancemodifier
-        self.hidden = hidden #doubles power consumption
+
+    def dict(self):
+        return {
+            'id': self.id,
+            'label': self.label,
+            'description': self.description,
+            'resistance': self.resistance,
+            'consumption': self.consumption,
+            'vision': self.vision,
+            'buildduration': self.buildduration,
+            'resistancemodifier': self.resistancemodifier,
+        }
 
 class Event:
     def __init__(self, id, label, priority):
         self.id = id
         self.label = label
         self.priority = priority
+
+    def dict(self):
+        return {
+                'id': self.name,
+                'label': self.label,
+                'priority': self.priority
+        }
 
 
 class NonNeighbourLink(Exception):
@@ -54,6 +89,10 @@ class VersionError(Exception):
 
 class Waiting(Exception):
     pass
+
+class GameOver(Exception):
+    pass
+
 
 nodetypes = {
     'unspecialised':  NodeType('unspecialised',"Unspecialised node","A regular unspecialised node", 1, 10, 1,1,1),
@@ -91,6 +130,7 @@ seed_defaulthideprob_spec = 0.25
 seed_defaulthighpowerprob = 0.02
 seed_defaultnonodeprob = 0.16
 seed_defaultbeginpower = 2000
+seed_defaultnullcores = 1
 
 class Game:
     def __init__(self, name, width, height, seed_beginpower= seed_defaultbeginpower, seed_nonodeprob=seed_defaultnonodeprob, seed_specprobs=seed_defaultspecprobs, seed_hideprob=seed_defaulthideprob, seed_hideprob_spec = seed_defaulthideprob_spec, seed_highpowerprob = seed_defaulthighpowerprob):
@@ -104,7 +144,16 @@ class Game:
 
         #self.changednodes = set() #will hold all changed nodes after a tick, needed to update clients
         self.visiblenodes = defaultdict(set) #will hold all visible nodes for each player
-        self.waiting = [] #list of players that need to complete their turn still
+
+    def dict(self):
+        return {
+                'name': self.name,
+                'players': [ p.dict() for p in self.players ],
+                'width': self.width,
+                'height': self.height,
+                'time': self.time,
+                'version': self.version
+        }
 
     def __iter__(self):
         for d in self.nodes.values():
@@ -115,22 +164,22 @@ class Game:
         valid = False
         while not valid:
             node = random.choice(iter(self))
-            neighbours = list(node.neighbours())
-            if len(neighbours) < 6:
-                continue
-
-            node.type = nodetypes['core']
-            node.power = seed_beginpower
-            valid = True
+            if node.type == 'unspecialised':
+                neighbours = list(node.neighbours())
+                if len(neighbours) >= 6:
+                    node.type = nodetypes['core']
+                    node.power = seed_beginpower
+                    valid = True
 
 
     def addplayer(self, name):
         beginnode = self.makebeginnode(seed_defaultbeginpower)
         player = Player(name, beginnode)
         self.players.append(player)
+        beginnode.owner = player
 
 
-    def createnodes(self, seed_nonodeprob, seed_specprobs, seed_highpowerprob, seed_hideprob, seed_hideprob_spec):
+    def createnodes(self, seed_nonodeprob, seed_specprobs, seed_highpowerprob, seed_hideprob, seed_hideprob_spec, seed_nullcores = seed_defaultnullcores, seed_beginpower = seed_defaultbeginpower):
         for x in range(1,self.width+1):
             for y in range(1,self.height+1):
                 if random.random() <= seed_nonodeprob:
@@ -160,22 +209,33 @@ class Game:
 
                 self.nodes[x][y] = Node(self, x, y, type, None, power, 0, hidden)
 
-    def tick(self):
-        #check if all players are synced
-        self.waiting = []
-        for player in self.players:
-            if player.time < self.game.time:
-                self.waiting.append(player)
+        if seed_nullcores > 0:
+            for i in range(0, seed_nullcores+1):
+                node = self.beginnode(seed_beginpower)
 
-        #one time tick (turn)
+    def waiting(self):
+        for player in self.players:
+            if player.time == self.game.time:
+                yield player
+
+
+    def tick(self):
+        #one time tick (turn), will be call by post() when last player completes his/her turn
         self.visiblenodes = defaultdict(set)
+        self.cores = defaultdict(int)
         for node in self:
             node.tick()
             if node.owner:
                 self.visiblenodes[node.owner] |= node.visiblenodes()
+            if node.type == nodetypes['core']:
+                self.cores[node.owner] += 1
+
+        if len(self.cores) == 1:
+            winner = self.cores.keys()[0]
+            winner.wins = True
+            raise GameOver(winner.name + " wins!")
 
     def getplayer(self, **kwargs):
-
         player = None
         if 'player' in kwargs:
             for p in self.players:
@@ -189,7 +249,6 @@ class Game:
 
 
     def post(self, **kwargs):
-        #parse json content
 
         if not 'version' in kwargs:
             raise CommunicationError("No version specified")
@@ -198,7 +257,8 @@ class Game:
 
 
         player = self.getplayer(**kwargs) #may raise Waiting exception
-
+        if player.lost:
+            raise GameOver("You lost :'(")
 
         if not 'command' in kwargs:
             raise CommunicationError("No command specified")
@@ -257,12 +317,19 @@ class Game:
 
 
     def get(self, **kwargs):
-        #HTTP get status
+        if 'init' in kwargs and kwargs['init'] == 1:
+            #get general status to initialise a client (regardless of player)
+            d = {'game': self.dict(), 'nodetypes': self.nodetypes(), 'events': self.events()}
+        else:
+            player = self.getplayer(**kwargs) #may raise Waiting exception
 
-        player = self.getplayer(**kwargs) #may raise Waiting exception
-
-        #get the state of the game
-        return json.dumps([ n.dict() for n in self.visiblenodes ])
+            #get the state of the game
+            if player.lost or player.wins:
+                #If you win or lose you get to see all nodes
+                d = {'players': [ p.dict() for p in self.players], 'nodes':  [ n.dict() for n in self ]}
+            else:
+                d = {'players': [ p.dict() for p in self.players], 'nodes':  [ n.dict() for n in self.visiblenodes ]}
+        return json.dumps(d)
 
 class Link:
     def __init__(self, source, target, power):
@@ -284,7 +351,7 @@ class Link:
 
 
 class Node:
-    def __init__(self, game, x, y, type, owner, power, buildtime, hidden):
+    def __init__(self, game, x, y, type, owner, power, buildtime, hidden=False):
         self.game = game
         self.x = x
         self.y = y
@@ -390,6 +457,23 @@ class Node:
                 if link.owner == attacker:
                     if link.source.type != nodetypes['unspecialised']:
                         link.source.type = nodetypes['unspecialised']
+        elif self.type == 'core':
+            self.type = nodetypes['unspecialised']
+            #does the player have a core left?
+            defeat = True
+            for node in self:
+                if node.type == 'core' and node.owner == self.owner:
+                    defeat = False
+                    break
+            if defeat:
+                self.owner.lost = True
+                #disown all the player's nodes, specs remain however!
+                for node in self:
+                    if node.owner == self.owner:
+                        node.owner = None
+
+
+
         self.type = nodetypes['unspecialised']
         self.hidden = False
 
@@ -499,6 +583,10 @@ class GameResource(resource.Resource):
         except NotEnoughPower as e:
             request.setHeader('Content-Type', "application/json")
             return "{ 'error': 'notenoughpower', 'errormsg': \"" +  str(e) + "\" }"
+        except GameOver as e:
+            request.setHeader('Content-Type', "application/json")
+            return "{ 'gameover': 1 }"
+
 
 class IndexResource(resource.Resource):
     def __init__(self, games):
