@@ -2,6 +2,7 @@
 
 
 import random
+import json
 from collections import defaultdict
 from twisted.web import server, resource
 from twisted.internet import reactor
@@ -18,7 +19,7 @@ class Player:
         return hash(self.name)
 
     def tick(self):
-        self.time = time + 1
+        self.time += 1
 
 class NodeType:
     def __init__(self, id, label, description, resistance, consumption, vision, buildduration, resistancemodifier=1, hidden=False):
@@ -46,6 +47,12 @@ class NotEnoughPower(Exception):
     pass
 
 class CommunicationError(Exception):
+    pass
+
+class VersionError(Exception):
+    pass
+
+class Waiting(Exception):
     pass
 
 nodetypes = {
@@ -86,7 +93,7 @@ seed_defaultnonodeprob = 0.16
 seed_defaultbeginpower = 2000
 
 class Game:
-    def __init__(self, name, width, height, seed_beginpower, seed_defaultbeginpower, seed_nonodeprob=seed_defaultnonodeprob, seed_specprobs=defaultspecseedprobs, seed_hideprob=seed_defaulthideprob, seed_hideprob_spec = seed_defaulthideprob_spec, seed_highpowerprob = seed_defaulthighpowerprob):
+    def __init__(self, name, width, height, seed_beginpower= seed_defaultbeginpower, seed_nonodeprob=seed_defaultnonodeprob, seed_specprobs=seed_defaultspecprobs, seed_hideprob=seed_defaulthideprob, seed_hideprob_spec = seed_defaulthideprob_spec, seed_highpowerprob = seed_defaulthighpowerprob):
         self.name = name
         self.width = width
         self.height = height
@@ -100,9 +107,9 @@ class Game:
         self.waiting = [] #list of players that need to complete their turn still
 
     def __iter__(self):
-        for d in nodes.values():
+        for d in self.nodes.values():
             for node in d.values():
-                yield nodes
+                yield node
 
     def makebeginnode(self, seed_beginpower):
         valid = False
@@ -123,7 +130,7 @@ class Game:
         self.players.append(player)
 
 
-    def createnodes(self, seed_nonodeprob, seed_specprobs, seed_highpowerprod, seed_hideprob, seed_hideprob_spec):
+    def createnodes(self, seed_nonodeprob, seed_specprobs, seed_highpowerprob, seed_hideprob, seed_hideprob_spec):
         for x in range(1,self.width+1):
             for y in range(1,self.height+1):
                 if random.random() <= seed_nonodeprob:
@@ -143,7 +150,8 @@ class Game:
                     if random.random() <= specprob:
                         hidden = (random.random() < seed_hideprob_spec)
                         r = random.random()
-                        for prob, t in seedprobs:
+                        summed = 0
+                        for prob, t in seed_specprobs:
                             if r <= summed + t:
                                 type = t
                                 break
@@ -156,7 +164,7 @@ class Game:
         #check if all players are synced
         self.waiting = []
         for player in self.players:
-            if player.time < game.time:
+            if player.time < self.game.time:
                 self.waiting.append(player)
 
         #one time tick (turn)
@@ -166,41 +174,71 @@ class Game:
             if node.owner:
                 self.visiblenodes[node.owner] |= node.visiblenodes()
 
-    def post(self, request):
+    def getplayer(self, **kwargs):
+
+        player = None
+        if 'player' in kwargs:
+            for p in self.players:
+                if p.name == kwargs['player']:
+                    player = p
+        if not player:
+            raise CommunicationError("No valid player specified")
+
+        if player.time > self.game.time:
+            raise Waiting(",".join(self.waiting))
+
+
+    def post(self, **kwargs):
         #parse json content
 
+        if not 'version' in kwargs:
+            raise CommunicationError("No version specified")
+        if kwargs.version != VERSION:
+            raise VersionError("Client and server versions do not match")
 
-        content = json.loads(content)
-        if not 'command' in content:
-            raise CommunicationError("No command in content")
-        if not 'args' in content:
-            raise CommunicationError("No arguments in content")
-        if not 'version' in content:
-            raise CommunicationError("No version in content")
-        command = content['command']
-        args = content['args']
 
-        if node:
-            node = content['node']
-            x = int(args[0])
-            y = int(args[1])
+        player = self.getplayer(**kwargs) #may raise Waiting exception
+
+
+        if not 'command' in kwargs:
+            raise CommunicationError("No command specified")
+
+
+
+        command = kwargs['command']
+
+
+        if 'x' in kwargs and 'y' in kwargs:
+            try:
+                x = int(kwargs['x'])
+                y = int(kwargs['y'])
+            except:
+                raise CommunicationError("Invalid (x,y), not numeric")
             if x in self.nodes and y in self.nodes[x]:
                 sourcenode = self.nodes[x][y]
+            else:
+                raise CommunicationError("Invalid (x,y), no node there")
             if sourcenode.owner != player:
                 raise CommunicationError("Sourcenode not owned by player!")
         else:
             sourcenode = None
 
         if command == 'done':
-
+            player.tick()
+            alldone = True
+            for p in self.players:
+                if p < player.time:
+                    alldone = False
+            if alldone:
+                self.game.tick()
         elif command == 'link':
             if sourcenode is None:
                 raise CommunicationError("No sourcenode specified, required for " +command)
             try:
-                x = int(args[1])
-                y = int(args[2])
+                x = int(kwargs['targetx'])
+                y = int(kwargs['targety'])
             except:
-                raise CommunicationError("Invalid arguments for " + command + ": " + ", ".join(args))
+                raise CommunicationError("Invalid arguments for " + command )
             if x in self.nodes and y in self.nodes[x]:
                 targetnode = self.nodes[x][y]
                 sourcenode.link(targetnode)
@@ -210,38 +248,39 @@ class Game:
             if sourcenode is None:
                 raise CommunicationError("No sourcenode specified, required for " +command)
             try:
-                newtype = int(args[0])
+                newtype = kwargs['type']
+                assert newtype in nodetypes
             except:
-                raise CommunicationError("Invalid arguments for " + command + ": " + ", ".join(args))
+                raise CommunicationError("Invalid arguments for " + command + ", expected type")
+            sourcenode.specialise(nodetypes[newtype])
 
 
 
-
-    def playerdone(self):
-        player.tick()
-
-    def get(self, player):
+    def get(self, **kwargs):
         #HTTP get status
 
-        if self.waiting:
+        player = self.getplayer(**kwargs) #may raise Waiting exception
 
-
-        else:
-
-        while player.time < game.time:
-            player.tick()
-
-
-
+        #get the state of the game
+        return json.dumps([ n.dict() for n in self.visiblenodes ])
 
 class Link:
     def __init__(self, source, target, power):
-           self.source = source
-           self.target = target
-           self.power = power
+        self.source = source
+        self.target = target
+        self.power = power
 
     def __eq__(self, other):
         return (self.source == other.source and self.target == other.target and self.power == other.power)
+
+    def dict(self):
+        return {
+                'sourcex': self.source.x,
+                'sourcey': self.source.y,
+                'targetx': self.target.x,
+                'targety': self.target.y,
+                'power': self.power,
+        }
 
 
 class Node:
@@ -256,31 +295,32 @@ class Node:
         self.owner = owner
         self.buildtime = buildtime #from what time on is this node built? (may be in future, node will then be in a reconfigure mode and acts as a normal node until done)
         self.hidden = hidden
+        self.lastevent = None
 
     def link(self, targetnode, power):
         if targetnode.x == self.x and targetnode.y == self.y:
-           raise NonNeighbourLink()
+            raise NonNeighbourLink()
         if abs(targetnode.x - self.x) > 1 or abs(targetnode.y - self.y) > 1:
-           raise NonNeighbourLink()
+            raise NonNeighbourLink()
 
-       for link in outlinks:
-           if link.target == targetnode: #update existing link
-               link.power += power
-               link.target.setevent(events['powerincrease'])
-               return True
+        for link in self.outlinks:
+            if link.target == targetnode: #update existing link
+                link.power += power
+                link.target.setevent(events['powerincrease'])
+                return True
 
 
-       for i, link in enumerate(inlinks):
-           if link.source == targetnode and link.source.owner == self.owner: #conflicting reverse link
-               if power < link.power:
-                    link.power -= power
+        for i, link in enumerate(self.inlinks):
+            if link.source == targetnode and link.source.owner == self.owner: #conflicting reverse link
+                if power < link.power:
+                     link.power -= power
+                     return True
+                else:
+                    power -= link.power
+                    #deletion
+                    link.source.inlinks.remove(link)
+                    del self.inlinks[i]
                     return True
-               else:
-                   power -= link.power
-                   #deletion
-                   link.source.inlinks.remove(link)
-                   del self.inlinks[i]
-                   return True
 
         link = Link(self, targetnode, power )
         self.outlinks.append(link)
@@ -309,7 +349,6 @@ class Node:
     def strength(self):
         if self.specialising():
             return self.energy()
-        else:
 
         if self.specialising():
             resistance = 1
@@ -341,7 +380,7 @@ class Node:
 
     def onassimilation(self, attacker):
         self.setevent(events["assimilatesuccess"])
-        if self.type == nodetype['corruption']:
+        if self.type == nodetypes['corruption']:
             if self.power > 0: #can't reverse corruptions
                 self.power = -1 * self.power
                 self.tick() #no extra tick, node may be lost again
@@ -356,7 +395,7 @@ class Node:
 
 
     def tick(self):
-        if node.type is None:
+        if self.type is None:
             return False
 
         #Check ownership
@@ -366,7 +405,7 @@ class Node:
         for link in self.inlinks:
             if link.owner != self.owner and link.source.type != nodetypes['collaborator']:
                 attackpower[link.source] += link.power
-        for attacker, attack in sorted(attackpower.items(), key= lambda x: x * -1)
+        for attacker, attack in sorted(attackpower.items(), key= lambda x: x * -1):
             if attack > self.strength():
                 self.onassimilation(attacker)
                 self.owner = attacker
@@ -374,7 +413,7 @@ class Node:
                 break
 
         #does the node receive enough pwoer to sustain itself?
-        while energy() <= 0 and self.owner != None:
+        while self.energy() <= 0 and self.owner != None:
             #No!
             if self.hidden:
                 #drop cloak, unhide
@@ -390,6 +429,8 @@ class Node:
                 #delete links
                 self.setevent(events["lostnode"])
             self.game.changednodes.add(self)
+
+        return True
 
 
     def setevent(self, event):
@@ -410,10 +451,23 @@ class Node:
         else:
             return set([n for n in self.neighbours(self.vision) if n.owner != self.owner])
 
-    def json(self):
-        #json report of node state for client
-        #TODO
-        pass
+    def dict(self):
+        #dictionary representation for clients (serialisable to json)
+        return {
+                'x': self.x,
+                'y': self.y,
+                'type': self.type.id,
+                'power': self.power,
+                'energy': self.energy(),
+                'strength': self.strength(),
+                'owner': self.owner.name,
+                'buildtime': self.buildtime,
+                'hidden': self.hidden,
+                'outlinks': [ link.dict() for link in self.outlinks ],
+                'inlinks': [ link.dict() for link in self.inlinks ],
+                'lastevent': self.lastevent.label if self.lastevent else "",
+                'lasteventpriority': self.lastevent.priority if self.lastevent else 100,
+        }
 
 
 
@@ -424,18 +478,27 @@ class GameResource(resource.Resource):
     def render_GET(self, request):
         try:
             request.setHeader('Content-Type', "application/json")
-            return self.game.get(request.args)
+            return self.game.get(**request.args)
         except CommunicationError as e:
             request.setResponseCode(403)
             return str(e)
+        except Waiting as e:
+            request.setHeader('Content-Type', "application/json")
+            return "{ 'error': 'waiting', 'errormsg': 'Waiting for other players to complete their turn' }"
 
     def render_POST(self, request):
         try:
             request.setHeader('Content-Type', "application/json")
-            return self.game.post(request.args)
-        except CommunicationError as e
+            return self.game.post(**request.args)
+        except CommunicationError as e:
             request.setResponseCode(403)
             return str(e)
+        except Waiting as e:
+            request.setHeader('Content-Type', "application/json")
+            return "{ 'error': 'waiting',  'errormsg': \"" +  str(e) + "\" }"
+        except NotEnoughPower as e:
+            request.setHeader('Content-Type', "application/json")
+            return "{ 'error': 'notenoughpower', 'errormsg': \"" +  str(e) + "\" }"
 
 class IndexResource(resource.Resource):
     def __init__(self, games):
@@ -443,7 +506,7 @@ class IndexResource(resource.Resource):
 
     def getChild(self, game, request):
         if game in self.games:
-            return GameResource(self.games[name])
+            return GameResource(self.games[game])
         else:
             request.setResponseCode(404)
             return "Game not found"
@@ -452,10 +515,12 @@ class BattleNodeServer:
     def __init__(self, port):
         assert isinstance(port, int)
         self.games = {}
-        reactor.listenTCP(port, server.Site(IndexResource(games)))
+        reactor.listenTCP(port, server.Site(IndexResource(self.games)))
         reactor.run()
 
 
+def main():
+    BattleNodeServer(7455)
 
 if __name__ == '__main__':
     main()
